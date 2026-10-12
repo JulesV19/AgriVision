@@ -1,0 +1,7 @@
+# torch est déjà installé sur Colab
+transformers>=4.56
+huggingface_hub
+opencv-python
+numpy
+tqdm
+matplotlib
