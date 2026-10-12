@@ -13,7 +13,8 @@ C'est la première étape avant de passer à l'estimation de sinistres (grêle, 
 | `agrivision/model.py` | `DinoSegmenter` : DINOv3 gelé, 4 couches intermédiaires, décodeur conv avec skip haute résolution |
 | `agrivision/losses.py` | CE « au moins une classe vraie », adaptée aux annotations qui se chevauchent, + Dice |
 | `agrivision/metrics.py` | mIoU officiel Agriculture-Vision (matrice de confusion modifiée) |
-| `agrivision/train.py` | Entraînement (bf16, cosine, reprise auto) et `--eval-only` |
+| `agrivision/train.py` | Entraînement (bf16, cosine, reprise auto), `--eval-only` avec TTA x8 |
+| `notebooks/train_colab_run1_executed.ipynb` | Run 1 exécuté (backbone gelé, sous-ensemble) : val 0,452 / test 0,429 |
 
 ## Démarrage sur Colab
 
@@ -33,10 +34,24 @@ C'est la première étape avant de passer à l'estimation de sinistres (grêle, 
 
 Conditions d'utilisation du dataset : voir `Agriculture-Vision Dataset Terms of Use.pdf` dans le bucket. Licence des poids : DINOv3 License (Meta).
 
-## Pistes après la PoC
+## Run 2 : « recette complète » (`notebooks/train_colab.ipynb`)
+
+Choix tirés des solutions publiées sur Agriculture-Vision 2021 (Tavera 2022, 2ᵉ places 2022 et 2024) :
+
+| Changement | Option | Gain publié |
+|---|---|---|
+| Toutes les données (56 944 train), évaluation sur le val officiel complet | `prepare_subset --full` | (comparabilité) |
+| 4 derniers blocs du ViT ajustés (lr 3e-5) | `--unfreeze-last 4 --backbone-lr 3e-5` | tous les bons résultats ajustent l'encodeur |
+| Perte pondérée par classe : (médiane/fréquence)^0.5 | `--class-weight-power 0.5` | +4,0 pts (ACW, 2024) |
+| Tirage des tuiles : 50 % uniforme, 50 % centré sur une anomalie | `--rcs-mix 0.5` | +2,4 pts avec mosaïque (2024) |
+| Mosaïques 2x2/3x3 réduites (p = 0,25) et zoom x1–1,5 | `--mosaic-p 0.25 --max-zoom 1.5` | (inclus ci-dessus) |
+| Prédiction moyennée sur 8 rotations et symétries | `--eval-only --tta 8` | +1 pt environ |
+
+Référence CNN optionnelle : `--arch smp --smp-encoder efficientnet-b3`, soit DeepLabV3+ avec environ 13 M de paramètres.
+
+## Pistes ensuite
 
 - `--backbone-res 768` : patchs plus fins, donc des contours meilleurs, mais environ 2,5× plus lent.
-- Backbone `dinov3-vits16plus` ou `dinov3-vitb16`, ou LoRA sur le ViT.
-- Le backbone satellite SAT-493M n'existe qu'en ViT-L et 7B.
-- Ajout du NIR via un adaptateur. Activation de `storm_damage`.
+- Backbone `dinov3-vits16plus` ou `dinov3-vitb16`.
+- Ajout du NIR via un adaptateur : +1,5 à +2,5 pts publiés. Activation de `storm_damage`.
 - Fine-tuning sur des données de sinistres réelles (grêle, sangliers).

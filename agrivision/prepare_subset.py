@@ -1,15 +1,19 @@
-"""Construit un sous-ensemble équilibré d'Agriculture-Vision 2021, prêt à mettre sur Drive.
+"""Prépare Agriculture-Vision 2021 au format compact utilisé pour l'entraînement.
 
 Entrée : le dossier extrait de Agriculture-Vision-2021.tar.gz (train/ et val/).
 Sortie :
-    out/{train,val,test}/rgb/<id>.jpg   (copie brute du JPG d'origine)
-    out/{train,val,test}/lbl/<id>.png   (uint16, bits décrits dans agrivision.LABEL_BITS)
-    out/meta.json                       (classes, tailles, fréquences de pixels)
+    out/<split>/rgb/<id>.jpg     (copie brute du JPG d'origine)
+    out/<split>/lbl/<id>.png     (uint16, bits décrits dans agrivision.LABEL_BITS)
+    out/<split>/tiles.npz        (ids + nombre de pixels par bit, pour l'échantillonnage des classes rares)
+    out/meta.json                (classes, tailles, fréquences de pixels)
 
-Le "test" est tiré du val officiel (les labels du test officiel ne sont pas publics),
-avec des parcelles (field ids) disjointes de celles du val qu'on garde pour la sélection de modèle.
+Deux modes :
+  - sous-ensemble équilibré (défaut) : train/val/test, le "test" étant tiré du val officiel sur des
+    parcelles disjointes (les labels du test officiel ne sont pas publics) ;
+  - --full : tout le train officiel (56 944 tuiles) et tout le val officiel (18 334 tuiles), comme
+    dans les papiers, pour comparer nos scores aux leurs.
 
-    python -m agrivision.prepare_subset --src /content/raw/Agriculture-Vision-2021 --out /content/agv_subset
+    python -m agrivision.prepare_subset --src /content/raw/Agriculture-Vision-2021 --out /content/agv_full --full
 """
 
 import argparse
@@ -25,6 +29,8 @@ import numpy as np
 from tqdm import tqdm
 
 from agrivision import CLASSES, LABEL_BITS
+
+N_BITS = max(LABEL_BITS.values()) + 1
 
 
 def read_bin(path):
@@ -48,20 +54,28 @@ def encode_tile(split_dir, tile_id):
     return lbl
 
 
+def bit_counts(lbl):
+    return [int(((lbl >> b) & 1).sum()) for b in range(N_BITS)]
+
+
 def tile_stats(args):
     """Nombre de pixels par bit (0 = valide) pour une tuile."""
     split_dir, tile_id = args
-    lbl = encode_tile(split_dir, tile_id)
-    return tile_id, [int(((lbl >> b) & 1).sum()) for b in range(max(LABEL_BITS.values()) + 1)]
+    return tile_id, bit_counts(encode_tile(split_dir, tile_id))
 
 
-def scan_split(split_dir, workers):
+def list_tiles(split_dir):
     ids = sorted(p.stem for p in (split_dir / "images" / "rgb").glob("*.jpg"))
     found = sorted(p.name for p in (split_dir / "labels").iterdir() if p.is_dir())
     print(f"[{split_dir.name}] {len(ids)} tuiles, dossiers de labels : {found}")
     missing = set(LABEL_BITS) - set(found)
     if missing:
         print(f"  attention, labels absents : {sorted(missing)}")
+    return ids
+
+
+def scan_split(split_dir, workers):
+    ids = list_tiles(split_dir)
     with Pool(workers) as pool:
         stats = dict(tqdm(pool.imap_unordered(tile_stats, [(split_dir, i) for i in ids], chunksize=64),
                           total=len(ids), desc=f"scan {split_dir.name}"))
@@ -113,17 +127,22 @@ def write_tile(args):
     shutil.copyfile(split_dir / "images" / "rgb" / f"{tile_id}.jpg", out_dir / "rgb" / f"{tile_id}.jpg")
     if with_nir:
         shutil.copyfile(split_dir / "images" / "nir" / f"{tile_id}.jpg", out_dir / "nir" / f"{tile_id}.jpg")
-    cv2.imwrite(str(out_dir / "lbl" / f"{tile_id}.png"), encode_tile(split_dir, tile_id))
+    lbl = encode_tile(split_dir, tile_id)
+    cv2.imwrite(str(out_dir / "lbl" / f"{tile_id}.png"), lbl)
+    return tile_id, bit_counts(lbl)
 
 
-def export(split_dir, out_dir, ids, stats, with_nir, workers):
+def export(split_dir, out_dir, ids, with_nir, workers):
     for sub in ["rgb", "lbl"] + (["nir"] if with_nir else []):
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
     with Pool(workers) as pool:
         jobs = [(split_dir, out_dir, i, with_nir) for i in ids]
-        list(tqdm(pool.imap_unordered(write_tile, jobs, chunksize=32), total=len(ids), desc=f"write {out_dir.name}"))
-    pix = np.array([stats[i] for i in ids]).sum(0)
-    tiles = np.array([[s >= 1 for s in stats[i]] for i in ids]).sum(0)
+        stats = dict(tqdm(pool.imap_unordered(write_tile, jobs, chunksize=32), total=len(ids),
+                          desc=f"write {out_dir.name}"))
+    ids = sorted(stats)
+    counts = np.array([stats[i] for i in ids], np.int64)
+    np.savez_compressed(out_dir / "tiles.npz", ids=np.array(ids), counts=counts)
+    pix, tiles = counts.sum(0), (counts > 0).sum(0)
     return {
         "n_tiles": len(ids),
         "valid_pixels": int(pix[0]),
@@ -136,6 +155,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", type=Path, required=True, help="dossier Agriculture-Vision-2021 extrait")
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--full", action="store_true", help="tout le train et tout le val officiels")
     ap.add_argument("--n-train", type=int, default=12000)
     ap.add_argument("--n-val", type=int, default=3000)
     ap.add_argument("--n-test", type=int, default=2000)
@@ -146,19 +166,23 @@ def main():
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    meta = {"classes": CLASSES, "label_bits": LABEL_BITS, "seed": args.seed, "splits": {}}
+    meta = {"classes": CLASSES, "label_bits": LABEL_BITS, "seed": args.seed, "full": args.full, "splits": {}}
 
-    train_stats = scan_split(args.src / "train", args.workers)
-    train_ids = balanced_pick(train_stats, args.n_train, rng, args.min_pixels)
-    meta["splits"]["train"] = export(args.src / "train", args.out / "train", train_ids, train_stats,
-                                     args.with_nir, args.workers)
+    if args.full:
+        for split in ["train", "val"]:
+            ids = list_tiles(args.src / split)
+            meta["splits"][split] = export(args.src / split, args.out / split, ids, args.with_nir, args.workers)
+    else:
+        train_stats = scan_split(args.src / "train", args.workers)
+        train_ids = balanced_pick(train_stats, args.n_train, rng, args.min_pixels)
+        meta["splits"]["train"] = export(args.src / "train", args.out / "train", train_ids,
+                                         args.with_nir, args.workers)
 
-    val_stats = scan_split(args.src / "val", args.workers)
-    val_pool, test_pool = split_by_field(list(val_stats), args.n_test / (args.n_val + args.n_test), rng)
-    for name, pool_ids, n in [("val", val_pool, args.n_val), ("test", test_pool, args.n_test)]:
-        ids = balanced_pick({i: val_stats[i] for i in pool_ids}, n, rng, args.min_pixels)
-        meta["splits"][name] = export(args.src / "val", args.out / name, ids, val_stats,
-                                      args.with_nir, args.workers)
+        val_stats = scan_split(args.src / "val", args.workers)
+        val_pool, test_pool = split_by_field(list(val_stats), args.n_test / (args.n_val + args.n_test), rng)
+        for name, pool_ids, n in [("val", val_pool, args.n_val), ("test", test_pool, args.n_test)]:
+            ids = balanced_pick({i: val_stats[i] for i in pool_ids}, n, rng, args.min_pixels)
+            meta["splits"][name] = export(args.src / "val", args.out / name, ids, args.with_nir, args.workers)
 
     (args.out / "meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta["splits"], indent=2))

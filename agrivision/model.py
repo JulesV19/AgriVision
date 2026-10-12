@@ -14,17 +14,27 @@ def conv_bn(cin, cout, k=3, stride=1):
     )
 
 
+def _blocks(vit):
+    """Liste des blocs transformer (le nom de l'attribut change selon la version de transformers)."""
+    n = vit.config.num_hidden_layers
+    for m in vit.modules():
+        if isinstance(m, nn.ModuleList) and len(m) == n:
+            return m
+    raise RuntimeError("blocs du ViT introuvables")
+
+
 class DinoSegmenter(nn.Module):
-    """Backbone DINOv3 ViT gelé + petit décodeur convolutif.
+    """Backbone DINOv3 ViT (gelé, ou derniers blocs ajustés) + petit décodeur convolutif.
 
     - On prend les patch tokens de plusieurs couches intermédiaires (1/16 de la résolution),
       normalisés par la LayerNorm finale (comme get_intermediate_layers(norm=True) de DINOv3).
     - Une petite branche convolutive sur l'image (1/2 et 1/4) récupère le détail fin que
       les patchs de 16 px perdent, pour des contours plus propres.
+    - unfreeze_last=k : les k derniers blocs du ViT (et sa LayerNorm finale) sont aussi entraînés.
     """
 
     def __init__(self, num_classes, backbone=DEFAULT_BACKBONE, layers=(2, 5, 8, 11), dim=256,
-                 backbone_res=None, freeze_backbone=True):
+                 backbone_res=None, unfreeze_last=0):
         super().__init__()
         self.backbone = AutoModel.from_pretrained(backbone)
         cfg = self.backbone.config
@@ -32,10 +42,12 @@ class DinoSegmenter(nn.Module):
         self.n_prefix = 1 + getattr(cfg, "num_register_tokens", 0)
         self.patch = cfg.patch_size
         self.backbone_res = backbone_res  # ex. 768 pour des patchs plus fins (plus lent)
-        self.freeze_backbone = freeze_backbone
-        if freeze_backbone:
-            self.backbone.requires_grad_(False)
-            self.backbone.eval()
+        self.unfreeze_last = unfreeze_last
+        self.backbone.requires_grad_(False)
+        if unfreeze_last > 0:
+            for blk in list(_blocks(self.backbone))[-unfreeze_last:]:
+                blk.requires_grad_(True)
+            self.backbone.norm.requires_grad_(True)
 
         c = cfg.hidden_size
         self.fuse = nn.Sequential(conv_bn(c * len(layers), dim, k=1), conv_bn(dim, dim))
@@ -48,15 +60,17 @@ class DinoSegmenter(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        if self.freeze_backbone:
-            self.backbone.eval()  # pas de dropout/drop-path dans le backbone gelé
+        self.backbone.eval()  # aucun dropout/drop-path dans DINOv3 : le mode eval ne change que ça
         return self
+
+    def backbone_parameters(self):
+        return [p for p in self.backbone.parameters() if p.requires_grad]
 
     def backbone_features(self, x):
         if self.backbone_res and self.backbone_res != x.shape[-1]:
             x = F.interpolate(x, size=(self.backbone_res, self.backbone_res), mode="bilinear", align_corners=False)
         h, w = x.shape[-2] // self.patch, x.shape[-1] // self.patch
-        with torch.set_grad_enabled(not self.freeze_backbone and torch.is_grad_enabled()):
+        with torch.set_grad_enabled(self.unfreeze_last > 0 and torch.is_grad_enabled()):
             out = self.backbone(pixel_values=x, output_hidden_states=True)
             n_layers = self.backbone.config.num_hidden_layers
             hidden = out.hidden_states[-n_layers:]  # sorties des blocs (sans l'embedding)
@@ -81,8 +95,27 @@ class DinoSegmenter(nn.Module):
         return F.interpolate(self.classifier(f), size=(H, W), mode="bilinear", align_corners=False)
 
     def head_state_dict(self):
-        """Poids entraînables seulement (le backbone gelé se recharge depuis HF)."""
-        sd = self.state_dict()
-        if self.freeze_backbone:
-            sd = {k: v for k, v in sd.items() if not k.startswith("backbone.")}
-        return sd
+        """Poids entraînés seulement (le reste du backbone se recharge depuis HF)."""
+        trainable = {n for n, p in self.named_parameters() if p.requires_grad}
+        return {k: v for k, v in self.state_dict().items() if not k.startswith("backbone.") or k in trainable}
+
+
+class SmpSegmenter(nn.Module):
+    """Référence CNN classique (segmentation_models_pytorch), entièrement entraînée.
+
+    arch ex. "DeepLabV3Plus", "FPN", "Unet" ; encoder ex. "efficientnet-b3", "resnet50".
+    """
+
+    def __init__(self, num_classes, arch="DeepLabV3Plus", encoder="efficientnet-b3"):
+        super().__init__()
+        import segmentation_models_pytorch as smp
+        self.net = getattr(smp, arch)(encoder_name=encoder, encoder_weights="imagenet", classes=num_classes)
+
+    def backbone_parameters(self):
+        return list(self.net.encoder.parameters())
+
+    def forward(self, x):
+        return self.net(x)
+
+    def head_state_dict(self):
+        return self.state_dict()
