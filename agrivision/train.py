@@ -78,6 +78,8 @@ def main():
                      persistent_workers=args.workers > 0)
 
     if args.eval_only:
+        if not (args.out / "best.pt").exists():
+            raise SystemExit(f"pas de best.pt dans {args.out} : l'entraînement n'a pas terminé au moins une epoch")
         ckpt = torch.load(args.out / "best.pt", map_location=device)
         model.load_state_dict(ckpt["model"], strict=False)
         loader = DataLoader(AgriVisionSubset(args.data, args.split), shuffle=False, **loader_kw)
